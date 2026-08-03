@@ -7,24 +7,22 @@
 #include "Topics.h"
 #include "MQTTPayLoads.h"
 
-
-//Definimos el pin y el tipo de sensor
+// Definimos el pin y el tipo de sensor
 #define DHTPIN1 A1 // Pin donde está conectado
 #define DHTPIN2 A2 
 #define DHTTYPE DHT11 // Tipo de sensor
 
-//Definimos el pin para el control de humedad
+// Definimos el pin para el control de humedad
 const int PIN_Humidificador = 5;
-//Pines para el control de la bombilla
+// Pines para el control de la bombilla y ventilador
 const int zero_cross = 3;
 const int disparador = 4;
-const int ventilador = 8;
-
+const int ventilador = 8; // Relé Active-LOW (LOW = Encendido, HIGH = Apagado)
 
 DHT dht1(DHTPIN1, DHTTYPE);
 DHT dht2(DHTPIN2, DHTTYPE);
 
-//Pines del invernadero
+// Pines del invernadero
 const int pin_sensorNivelagua = A0; // Pin analógico para el sensor de nivel de agua
 
 // Instancia global del temporizador 1
@@ -38,37 +36,31 @@ bool humidificadorActivo = false;
 bool ventiladorActivo = false;
 bool estadoInicialPublicado = false;
 
-//Variables para guardar las temperaturas y humedades
+// Bandera para sincronizar el temporizador con la máquina de estados (Evita Race Conditions)
+volatile bool flag_enviarDatos = false;
+
+// Variables para guardar las temperaturas y humedades
 volatile float temperatura1 = 20;
 volatile float humedad1 = 0;
 volatile float temperatura2 = 21;
 volatile float humedad2 = 0;
 volatile float temperaturaPromedio = 0;
 volatile float humedadPromedio = 0;
-volatile bool flag_enviarDatos = false;
 
-//Variable para almacenar el nivel del agua
+// Variable para almacenar el nivel del agua
 volatile float nivel_agua = 0;
 
-//Bandera para detener el timer2
-volatile bool disparar = false;
-
-//Variables para usar el serial de momento
+// Variables para usar el serial de momento
 String mensajeRecibido = "";     // Aquí se guardará el texto final (sin el '_')
 String bufferTemporal = "";      // Va acumulando los caracteres que van llegando
 
-//Variable para gurdar la frecuencia de disparo
-float frecuencia_disparo = 120*8; // Frecuencia de disparo en Hz
-
-//Variables para el control PID del piezoeléctrico
-
-// Duty cycle (0 - 100 %)
+// Variables para el control PID del piezoeléctrico
 static unsigned long inicioPeriodo = 0;
 volatile float duty = 0.4; // Valor inicial del duty cycle (40%)
 int setpoint = 75; // Valor de referencia para la humedad relativa
-unsigned long periodo_ms = 1000; // Periodo de la señal PWM en milisegundos
+unsigned long periodo_ms = 1000; // Periodo de la señal PWM en milisegundos (1 Hz)
 
-//Posibles estados que puede tener la maquina de estados
+// Posibles estados que puede tener la maquina de estados
 typedef enum {
   IDLE,
   enviarDatos,
@@ -83,7 +75,7 @@ typedef enum {
   RHmedia_Tbaja,
 } Estado;
 
-Estado estadoActual = medirTemperatura; // Estado inicial de la máquina de estados
+Estado estadoActual = IDLE; // Estado inicial corregido a IDLE para esperar el primer disparo del timer
 
 typedef enum {
   automatico,
@@ -91,22 +83,19 @@ typedef enum {
 } Modo;
 Modo modoControl = automatico;
 
-
-//Funciones para el manejo de la maquina de estados
+// Prototipos de funciones
 void funcion_enviarTemperatura();
 void funcion_enviarNivelAgua();
 void configurarTimer(float frecuenciaHz);
 void funcionInterrupcion(timer_callback_args_t *args);
-
 void funcionInterpretarMensaje(const String& mensaje);
 void serialEvent();
-void funcionPara_disparar ();
+void funcionPara_disparar();
 void calcularDutyCycle();
 void PWM_Humidificador();
 void manejarMensajeMQTT(const char* topic, const char* payload);
 void publicarEstadoActuadores();
 void publicarEstadoControl();
-
 void maquinaDeEstados();
 void leerSensores();
 
@@ -115,26 +104,33 @@ void setup() {
     dht1.begin();
     dht2.begin();
     configurarTimer(0.5f); // Configuramos el temporizador para que interrumpa cada 2 s
+    
     pinMode(PIN_Humidificador, OUTPUT);
-    digitalWrite(PIN_Humidificador,LOW);
+    digitalWrite(PIN_Humidificador, LOW);
+    
     pinMode(zero_cross, INPUT); // Configuramos el pin del cruce por cero como entrada
-    //attachInterrupt(digitalPinToInterrupt(zero_cross), funcionPara_disparar, RISING); // Configuramos la interrupción para el cruce por cero
-    pinMode(disparador,OUTPUT);
-    digitalWrite(ventilador,HIGH);
-    digitalWrite(disparador,LOW);
-    digitalWrite(PIN_Humidificador,LOW);
+    // attachInterrupt(digitalPinToInterrupt(zero_cross), funcionPara_disparar, RISING); 
+    
+    pinMode(disparador, OUTPUT);
+    digitalWrite(disparador, LOW);
+    
+    pinMode(ventilador, OUTPUT);
+    digitalWrite(ventilador, HIGH); // Apagado por defecto (Relé Active-LOW)
+    
     inicioPeriodo = millis();
 
     wifiManager.begin();
     mqttManager.begin();
     mqttManager.setMessageHandler(manejarMensajeMQTT);
-    estadoActual = medirTemperatura; // Estado inicial de la máquina de estados
-
 }
 
 void loop() {
+  
   wifiManager.loop();
   mqttManager.loop();
+  
+  // Ejecutamos serialEvent explícitamente para el Arduino UNO R4
+  serialEvent();
 
   if (mqttManager.isConnected() && !estadoInicialPublicado) {
     publicarEstadoActuadores();
@@ -142,51 +138,60 @@ void loop() {
     estadoInicialPublicado = true;
   }
 
+  // Máquina de estados controlada por la bandera del temporizador
   maquinaDeEstados();
+  
+  // El PWM debe correr continuamente, independiente de los estados
+  PWM_Humidificador();
 }
 
 void maquinaDeEstados() {
   switch (modoControl) {
     case automatico:
-      // En modo automático, ejecutamos la máquina de estados normal
         switch (estadoActual) {
           case IDLE:
+            // Solo salimos de IDLE si el timer levantó la bandera
+            if (flag_enviarDatos == true) {
+                flag_enviarDatos = false;
+                estadoActual = enviarDatos;
+            }
             break;
 
-          case medirTemperatura:
-          if (flag_enviarDatos == true) {
-                flag_enviarDatos = false; // Bajamos la bandera
+          case enviarDatos:
             funcion_enviarTemperatura();
             funcion_enviarNivelAgua();
-            //Condicional para generar el estado de alarma
+            // Condicional para generar el estado de alarma
             if (nivel_agua < 7){
               Serial.println("A_");
             }
+            if (modoControl == automatico) {
+              estadoActual = medirTemperatura;
+            } else {
+              estadoActual = IDLE;
+            }
+            break;
 
-            }
-            }
+          case medirTemperatura:
               temperatura1 = dht1.readTemperature();
               temperatura2 = dht2.readTemperature();
               temperaturaPromedio = (temperatura1 + temperatura2) / 2.0f;
 
               if (temperaturaPromedio > 40){
                 estadoActual = tempAlta;
-              }
-              else{
+              } else {
                 estadoActual = medirRH_Tbaja;
               }
               break;
 
           case tempAlta:
-              // Si la temperatura es alta, encendemos el ventilador
-              detachInterrupt(digitalPinToInterrupt(zero_cross)); // Deshabilitamos la interrupción del cruce por cero
+              // Si la temperatura es alta, apagamos bombilla y encendemos ventilador
+              detachInterrupt(digitalPinToInterrupt(zero_cross)); 
               bombillaActiva = false;
-              digitalWrite(disparador,LOW);
-              digitalWrite(ventilador, LOW); // Encender el ventilador
+              digitalWrite(disparador, LOW);
+              digitalWrite(ventilador, LOW); // LOW enciende el relé
               ventiladorActivo = true;
               estadoActual = medirRH_Talta;
               break;
-
           
           case medirRH_Talta:
               humedad1 = dht1.readHumidity();
@@ -195,23 +200,21 @@ void maquinaDeEstados() {
 
               if (humedadPromedio < 70){
                 estadoActual = RHbaja_Talta;
-              }
-              else{
+              } else {
                 estadoActual = RHalta_Talta;
               }
               break;
 
           case RHbaja_Talta:
               humidificadorActivo = true;
-              calcularDutyCycle(); // Calculamos el duty cycle para el humidificador
-              PWM_Humidificador(); // Controlamos el humidificador con el duty cycle calculado
-              estadoActual = medirTemperatura; // Volvemos a medir la humedad
+              calcularDutyCycle(); // Calculamos, pero el loop ejecuta el PWM
+              estadoActual = IDLE; // Volvemos a reposo para no saturar el DHT11
               break;
 
           case RHalta_Talta:
               humidificadorActivo = false;
-              digitalWrite(PIN_Humidificador,LOW); // Apagamos el humidificador
-              estadoActual = medirTemperatura; // Volvemos a medir la humedad
+              // El loop apagará el humidificador automáticamente
+              estadoActual = IDLE;
               break;
 
           case medirRH_Tbaja:
@@ -221,50 +224,53 @@ void maquinaDeEstados() {
 
               if (humedadPromedio < 70){
                 estadoActual = RHbaja_Tbaja;
-              }
-              else if (humedadPromedio >= 70 && humedadPromedio <= 80){
+              } else if (humedadPromedio >= 70 && humedadPromedio <= 80){
                 estadoActual = RHmedia_Tbaja;
-              }
-              else{
+              } else {
                 estadoActual = RHalta_Tbaja;
               }
               break;
           
           case RHbaja_Tbaja:
               humidificadorActivo = true;
-              calcularDutyCycle(); // Calculamos el duty cycle para el humidificador
-              PWM_Humidificador();// Controlamos el humidificador con el duty cycle calculado
-              digitalWrite(disparador,LOW);
-              detachInterrupt(digitalPinToInterrupt(zero_cross)); // Deshabilitamos la interrupción del cruce por cero
+              calcularDutyCycle(); 
+              
+              digitalWrite(disparador, LOW);
+              detachInterrupt(digitalPinToInterrupt(zero_cross)); 
               bombillaActiva = false;
-              digitalWrite(ventilador, HIGH);
+              
+              digitalWrite(ventilador, HIGH); // Apagamos el ventilador (HIGH)
               ventiladorActivo = false;
-              estadoActual = medirTemperatura; // Volvemos a medir la humedad
+              
+              estadoActual = IDLE;
               break;
 
           case RHmedia_Tbaja:
               humidificadorActivo = false;
-              digitalWrite(disparador,LOW);
-              detachInterrupt(digitalPinToInterrupt(zero_cross)); // Deshabilitamos la interrupción del cruce por cero
+              
+              digitalWrite(disparador, LOW);
+              detachInterrupt(digitalPinToInterrupt(zero_cross)); 
               bombillaActiva = false;
-              digitalWrite(ventilador, LOW); // Encender el ventilador
+              
+              digitalWrite(ventilador, LOW); // Encendemos el ventilador (LOW)
               ventiladorActivo = true;
-              digitalWrite(PIN_Humidificador,LOW); // Apagamos el humidificador
-              estadoActual = medirTemperatura; // Volvemos a medir la humedad
+              
+              estadoActual = IDLE;
               break;
 
           case RHalta_Tbaja:
-              attachInterrupt(digitalPinToInterrupt(zero_cross), funcionPara_disparar, RISING); // Habilitamos la interrupción del cruce por cero
+              attachInterrupt(digitalPinToInterrupt(zero_cross), funcionPara_disparar, RISING); 
               bombillaActiva = true;
-              digitalWrite(ventilador, HIGH); // Apagamos el ventilador
+              
+              digitalWrite(ventilador, HIGH); // Apagamos el ventilador (HIGH)
               ventiladorActivo = false;
-              digitalWrite(PIN_Humidificador,LOW); // Apagamos el humidificador
+              
               humidificadorActivo = false;
-              estadoActual = medirTemperatura; // Volvemos a medir la humedad
+              
+              estadoActual = IDLE;
               break;
 
           default:
-            // Si por alguna razón el estado es inválido, volvemos a IDLE
             estadoActual = IDLE;
             break;
           }
@@ -272,33 +278,24 @@ void maquinaDeEstados() {
 
     case manual:
       // En modo manual, no hacemos nada en la máquina de estados
-      break;;
+      break;
 
     default:
-      // Si por alguna razón el modo de control es inválido, también salimos
       break;
   }
-
 }
 
 void configurarTimer(float frecuenciaHz) {
     uint8_t tipo_timer = 0;
     int canal_timer = 0;
 
-    // 1. Buscar un canal de temporizador AGT (Asynchronous General-Purpose Timer) disponible
     if (!FspTimer::get_available_timer(tipo_timer, canal_timer)) {
         Serial.println("Error: No hay temporizadores disponibles.");
         return;
     }
 
-    // 2. Configurar las propiedades del temporizador
-    // Usamos el modo PERIODIC y el temporizador AGT seleccionado
     temporizador1.begin(TIMER_MODE_PERIODIC, tipo_timer, canal_timer, frecuenciaHz, 50.0f, funcionInterrupcion, nullptr);
-
-    // 3. Habilitar la interrupción en el controlador de interrupciones (NVIC)
     temporizador1.setup_overflow_irq();
-
-    // 4. Abrir e iniciar el temporizador
     temporizador1.open();
     temporizador1.start();
 
@@ -306,10 +303,8 @@ void configurarTimer(float frecuenciaHz) {
     Serial.println(canal_timer);
 }
 
-
 void funcionInterrupcion(timer_callback_args_t *args) {
-    flag_enviarDatos = true; // Cambiamos al estado de enviar datos
-   
+    flag_enviarDatos = true; // Solo levantamos bandera (evita Condition Race)
 }
 
 void leerSensores() {
@@ -323,6 +318,13 @@ void leerSensores() {
 }
 
 void funcion_enviarTemperatura() {
+    Serial.print("T_");
+    Serial.print (temperatura1);
+    Serial.print ("_");
+    Serial.print (temperatura2);
+    Serial.print ("_");
+    Serial.print (temperaturaPromedio);
+    Serial.println(); // Añadido para mejor visualización en consola
 
     mqttManager.publish(TOPIC_SENSOR_TEMPERATURA,
                          String(temperaturaPromedio, 2).c_str());
@@ -332,54 +334,46 @@ void funcion_enviarTemperatura() {
     publicarEstadoControl();
 }
 
-
 void funcion_enviarNivelAgua (){
-  float lecturaADC = analogRead(pin_sensorNivelagua); // Leer el valor del sensor de nivel de agua
-
-  // Convertir la lectura ADC a voltaje (0-5V)
-  float voltaje = lecturaADC *  (5/ 1023.0); 
+  float lecturaADC = analogRead(pin_sensorNivelagua); 
+  float voltaje = lecturaADC * (5.0 / 1023.0); 
+  
   if (voltaje <= 2.9) {
-    nivel_agua = 5*voltaje;
+    nivel_agua = 5 * voltaje;
   }
   else if (voltaje > 2.9 && voltaje <= 3.1 ){
-    nivel_agua = 7*voltaje;
+    nivel_agua = 7 * voltaje;
   }
-  else if (voltaje > 3.1 && voltaje<= 3.2){
-    nivel_agua = 10*voltaje;
+  else if (voltaje > 3.1 && voltaje <= 3.2){
+    nivel_agua = 10 * voltaje;
   }
   else{
-    nivel_agua = 14.2*voltaje;
+    nivel_agua = 14.2 * voltaje;
   }
 
-  mqttManager.publish(TOPIC_SENSOR_NIVEL_AGUA,
-                      String(int(nivel_agua)).c_str());
+  mqttManager.publish(TOPIC_SENSOR_NIVEL_AGUA, String(int(nivel_agua)).c_str());
 
   if (nivel_agua < 7) {
-    mqttManager.publish(TOPIC_SISTEMA_ALARMA,
-                        ALARM_TANQUE_VACIO);
+    mqttManager.publish(TOPIC_SISTEMA_ALARMA, ALARM_TANQUE_VACIO);
   }
 }
 
 void serialEvent() {
-  // Mientras haya bytes en el búfer de hardware, los procesamos de inmediato
   while (Serial.available()) {
     char caracterEntrante = (char)Serial.read();
     
-    // Si encontramos el carácter indicador '_'
     if (caracterEntrante == '_') {
-      mensajeRecibido = bufferTemporal; // Guardamos TODO el texto acumulado HASTA AHORA
-      bufferTemporal = "";              // Limpiamos el buffer para el siguiente mensaje
-      funcionInterpretarMensaje(mensajeRecibido); // Cambiamos al estado de interpretación de comando
+      mensajeRecibido = bufferTemporal; 
+      bufferTemporal = "";              
+      funcionInterpretarMensaje(mensajeRecibido); 
     } 
-    // Si no es el '_', y tampoco son caracteres basura de control (como el salto de línea)
     else if (caracterEntrante != '\n' && caracterEntrante != '\r') {
-      bufferTemporal += caracterEntrante; // Seguimos acumulando el texto
+      bufferTemporal += caracterEntrante; 
     }
   }
 }
 
-void funcionInterpretarMensaje(const String& mensaje)
-{
+void funcionInterpretarMensaje(const String& mensaje) {
   if (mensaje == "A" || mensaje.equalsIgnoreCase(PAYLOAD_AUTO)) {
     modoControl = automatico;
     publicarEstadoControl();
@@ -388,51 +382,44 @@ void funcionInterpretarMensaje(const String& mensaje)
     modoControl = manual;
     publicarEstadoControl();
   }
-  else if(mensaje.equalsIgnoreCase("V1") || mensaje.equalsIgnoreCase(PAYLOAD_ON)) {
+  else if(mensaje.equalsIgnoreCase("V1")) {
     if (modoControl == manual) {
-      digitalWrite(ventilador,LOW);
+      digitalWrite(ventilador, LOW); // LOW enciende el relé
       ventiladorActivo = true;
       publicarEstadoActuadores();
     }
   }
- 
-  else if(mensaje.equalsIgnoreCase("V0") || mensaje.equalsIgnoreCase(PAYLOAD_OFF)) {
+  else if(mensaje.equalsIgnoreCase("V0")) {
     if (modoControl == manual) {
-      digitalWrite(ventilador,HIGH);
+      digitalWrite(ventilador, HIGH); // HIGH apaga el relé
       ventiladorActivo = false;
       publicarEstadoActuadores();
     }
   }
-  else if (mensaje.equalsIgnoreCase("B1") || mensaje.equalsIgnoreCase(PAYLOAD_ON)) {
+  else if (mensaje.equalsIgnoreCase("B1")) {
     if (modoControl == manual) {
       attachInterrupt(digitalPinToInterrupt(zero_cross), funcionPara_disparar, RISING);
       bombillaActiva = true;
       publicarEstadoActuadores();
     }
   }
-  else if (mensaje.equalsIgnoreCase("B0") || mensaje.equalsIgnoreCase(PAYLOAD_OFF)) {
+  else if (mensaje.equalsIgnoreCase("B0")) {
     if (modoControl == manual) {
       detachInterrupt(digitalPinToInterrupt(zero_cross));
       bombillaActiva = false;
-      digitalWrite(disparador,LOW);
+      digitalWrite(disparador, LOW);
       publicarEstadoActuadores();
     }
-  }
-  else {
-    // Comando no reconocido, volver a IDLE
-    estadoActual = IDLE;
   }
 }
 
 void funcionPara_disparar (){
-    //disparar = true;
-    digitalWrite(disparador,LOW);
-    delay(6);
-    digitalWrite(disparador,HIGH);
+    digitalWrite(disparador, LOW);
+    delay(6); // Retardo para el Triac 
+    digitalWrite(disparador, HIGH);
 }
 
-void manejarMensajeMQTT(const char* topic, const char* payload)
-{
+void manejarMensajeMQTT(const char* topic, const char* payload) {
     String mensaje = String(payload);
 
     if (String(topic) == TOPIC_CFG_MODO) {
@@ -461,19 +448,16 @@ void manejarMensajeMQTT(const char* topic, const char* payload)
     else if (String(topic) == TOPIC_CMD_HUMIDIFICADOR) {
         if (mensaje.equalsIgnoreCase(PAYLOAD_ON)) {
             humidificadorActivo = true;
-            digitalWrite(PIN_Humidificador, HIGH);
             publicarEstadoActuadores();
         }
         else if (mensaje.equalsIgnoreCase(PAYLOAD_OFF)) {
             humidificadorActivo = false;
-            digitalWrite(PIN_Humidificador, LOW);
             publicarEstadoActuadores();
         }
     }
 }
 
-void publicarEstadoActuadores()
-{
+void publicarEstadoActuadores() {
     String payload = "VENTILADOR=";
     payload += ventiladorActivo ? PAYLOAD_ON : PAYLOAD_OFF;
     payload += ";BOMBILLA=";
@@ -487,8 +471,7 @@ void publicarEstadoActuadores()
     mqttManager.publish(TOPIC_ESTADO_HUMIDIFICADOR, humidificadorActivo ? PAYLOAD_ON : PAYLOAD_OFF);
 }
 
-void publicarEstadoControl()
-{
+void publicarEstadoControl() {
     mqttManager.publish(TOPIC_ESTADO_MODO,
                         (modoControl == automatico) ? PAYLOAD_AUTO : PAYLOAD_MANUAL);
     mqttManager.publish(TOPIC_ESTADO_SETPOINT,
@@ -496,50 +479,52 @@ void publicarEstadoControl()
 }
 
 void calcularDutyCycle() {
-    // Constantes del PID
-    const float Kp = 1.0; // Ganancia proporcional
-    const float Ki = 0.1; // Ganancia integral
-    const float Kd = 0.05; // Ganancia derivativa
+    const float Kp = 1.0; 
+    const float Ki = 0.1; 
+    const float Kd = 0.05; 
 
     static float errorAnterior = 0;
     static float integral = 0;
 
-    // Calcular el error
     float error = setpoint - humedadPromedio;
-
-    // Calcular la integral y la derivada
     integral += error;
+
+    // --- ANTI-WINDUP SENCILLO ---
+    if (integral > 1000.0) {
+        integral = 1000.0;
+    } else if (integral < 0.0) {
+        integral = 0.0;
+    }
+
     float derivada = error - errorAnterior;
+    float salidaPID = (Kp * error) + (Ki * integral) + (Kd * derivada);
 
-    // Calcular el output del PID
-    duty = Kp * error + Ki * integral + Kd * derivada;
+    duty = salidaPID / 100.0; 
 
-    duty = duty/100.0; // Convertir a porcentaje
-
-    // Guardar el error actual para la próxima iteración
-    errorAnterior = error;
-
-    // Asegurarse de que el duty cycle esté entre 0 y 1
+    // --- LÍMITE AL DUTY CYCLE ---
     if (duty < 0.0f) duty = 0.0f;
     if (duty > 1.0f) duty = 1.0f;
+
+    errorAnterior = error;
+    
     Serial.print("Duty cycle calculado: ");
     Serial.println(duty);
 }
 
 void PWM_Humidificador() {
-    unsigned long tiempo_actual = millis();
-    unsigned long tiempo = tiempo_actual - inicioPeriodo;
-    unsigned long tiempoON;
     if (!humidificadorActivo) {
         digitalWrite(PIN_Humidificador, LOW);
         return; 
     }
 
+    unsigned long tiempo_actual = millis();
+    unsigned long tiempo = tiempo_actual - inicioPeriodo;
+    
     if(tiempo >= periodo_ms) {
         inicioPeriodo = tiempo_actual; 
         tiempo = 0;
     }
-    tiempoON = periodo_ms * duty;
+    
+    unsigned long tiempoON = periodo_ms * duty;
     digitalWrite(PIN_Humidificador, tiempo < tiempoON);
 }
-
