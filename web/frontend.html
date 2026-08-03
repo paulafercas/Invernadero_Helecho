@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Invernadero MQTT</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #f3f7f4; margin: 0; padding: 24px; color: #163b2e; }
+    .card { background: white; border-radius: 14px; padding: 18px; margin-bottom: 16px; box-shadow: 0 4px 14px rgba(0,0,0,0.08); }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
+    .metric { border: 1px solid #d8e8de; border-radius: 12px; padding: 14px; background: #fbfffc; }
+    .metric h3 { margin-top: 0; margin-bottom: 8px; }
+    .value { font-size: 28px; font-weight: bold; }
+    .muted { color: #678; font-size: 13px; }
+    .status { font-weight: bold; padding: 6px 10px; border-radius: 999px; display: inline-block; }
+    .status.on { background: #dff7e6; color: #1f7a3b; }
+    .status.off { background: #fce8e8; color: #b42318; }
+    .controls button, .controls input { margin: 6px 6px 6px 0; padding: 8px 12px; border-radius: 8px; border: 1px solid #cddbd5; }
+    .controls button { cursor: pointer; background: #1f7a3b; color: white; }
+    .controls button.secondary { background: #0f4d3d; }
+    .alarm { background: #fff4f4; color: #b42318; padding: 12px; border-radius: 10px; border: 1px solid #f0b3b3; font-weight: bold; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <h1>Panel de control del invernadero</h1>
+  <div id="alarm" class="alarm hidden"></div>
+
+  <div class="card">
+    <div class="grid">
+      <div class="metric">
+        <h3>🌡️ Temperatura</h3>
+        <div id="temperatura" class="value">--</div>
+        <div class="muted">Incertidumbre ±0.35 °C</div>
+      </div>
+      <div class="metric">
+        <h3>💧 Humedad relativa</h3>
+        <div id="humedad" class="value">--</div>
+        <div class="muted">Incertidumbre ±2 %</div>
+      </div>
+      <div class="metric">
+        <h3>🚰 Nivel de agua</h3>
+        <div id="nivel_agua" class="value">--</div>
+        <div class="muted">Incertidumbre ±1 mm</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Actuadores</h2>
+    <div class="grid">
+      <div class="metric">
+        <h3>🌀 Ventilador</h3>
+        <div id="ventilador_state" class="status off">OFF</div>
+        <div class="controls" style="margin-top: 10px;">
+          <button onclick="sendActuador('ventilador','ON')">Encender</button>
+          <button onclick="sendActuador('ventilador','OFF')">Apagar</button>
+        </div>
+      </div>
+      <div class="metric">
+        <h3>💡 Bombilla</h3>
+        <div id="bombilla_state" class="status off">OFF</div>
+        <div class="controls" style="margin-top: 10px;">
+          <button onclick="sendActuador('bombilla','ON')">Encender</button>
+          <button onclick="sendActuador('bombilla','OFF')">Apagar</button>
+        </div>
+      </div>
+      <div class="metric">
+        <h3>💦 Humidificador</h3>
+        <div id="humidificador_state" class="status off">OFF</div>
+        <div class="controls" style="margin-top: 10px;">
+          <button onclick="sendActuador('humidificador','ON')">Encender</button>
+          <button onclick="sendActuador('humidificador','OFF')">Apagar</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Control</h2>
+    <div class="controls">
+      <button class="secondary" onclick="sendMode('AUTO')">Control automático</button>
+      <button onclick="sendMode('MANUAL')">Control manual</button>
+      <input id="setpoint_input" type="number" min="0" max="100" value="70" />
+      <button onclick="sendSetpoint()">Enviar setpoint</button>
+    </div>
+    <p id="modo_text">Modo actual: AUTO</p>
+    <p id="setpoint_text">Setpoint actual: 70 %</p>
+  </div>
+
+  <script>
+    async function fetchState() {
+      const response = await fetch('/api/state');
+      const data = await response.json();
+      document.getElementById('temperatura').textContent = (data.temperatura ?? '--') + ' °C';
+      document.getElementById('humedad').textContent = (data.humedad ?? '--') + ' %';
+      document.getElementById('nivel_agua').textContent = (data.nivel_agua ?? '--') + ' mm';
+      setStatus('ventilador_state', data.ventilador || 'OFF');
+      setStatus('bombilla_state', data.bombilla || 'OFF');
+      setStatus('humidificador_state', data.humidificador || 'OFF');
+      document.getElementById('modo_text').textContent = 'Modo actual: ' + (data.modo || 'AUTO');
+      document.getElementById('setpoint_text').textContent = 'Setpoint actual: ' + (data.setpoint ?? 70) + ' %';
+      const alarm = document.getElementById('alarm');
+      if (data.alarma && data.alarma.toUpperCase().includes('TANQUE')) {
+        alarm.classList.remove('hidden');
+        alarm.textContent = '⚠️ Alerta: el tanque de agua está por debajo de 7 mm.';
+      } else {
+        alarm.classList.add('hidden');
+      }
+    }
+
+    function setStatus(id, value) {
+      const el = document.getElementById(id);
+      const normalized = (value || 'OFF').toUpperCase();
+      el.textContent = normalized;
+      el.className = 'status ' + (normalized === 'ON' ? 'on' : 'off');
+    }
+
+    async function sendMode(mode) {
+      await fetch('/api/control/modo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode })
+      });
+      await fetchState();
+    }
+
+    async function sendSetpoint() {
+      const val = document.getElementById('setpoint_input').value;
+      await fetch('/api/control/setpoint', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value: parseInt(val, 10) })
+      });
+      await fetchState();
+    }
+
+    async function sendActuador(name, command) {
+      await fetch('/api/control/actuador', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, command })
+      });
+      await fetchState();
+    }
+
+    setInterval(fetchState, 2000);
+    fetchState();
+  </script>
+</body>
+</html>
