@@ -1,3 +1,3 @@
 streamlit
-flask
+streamlit-autorefresh
 paho-mqtt

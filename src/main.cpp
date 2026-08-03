@@ -513,7 +513,7 @@ void calcularDutyCycle() {
 
 void PWM_Humidificador() {
     if (!humidificadorActivo) {
-        digitalWrite(PIN_Humidificador, LOW);
+        digitalWrite(PIN_Humidificador, HIGH); // Apagamos el humidificador
         return; 
     }
 
@@ -525,6 +525,6 @@ void PWM_Humidificador() {
         tiempo = 0;
     }
     
-    unsigned long tiempoON = periodo_ms * duty;
+    unsigned long tiempoON = periodo_ms * (1 -duty);
     digitalWrite(PIN_Humidificador, tiempo < tiempoON);
 }

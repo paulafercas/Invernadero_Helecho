@@ -1,160 +1,176 @@
-import json
 import threading
 import time
-from collections import deque
-from pathlib import Path
+from copy import deepcopy
+from typing import Any, Dict, Optional
 
-import paho.mqtt.client as mqtt
-from flask import Flask, jsonify, render_template_string, request
+from mqtt_manager import MQTTManager
+from topics import (
+    TOPIC_CMD_BOMBILLA,
+    TOPIC_CMD_HUMIDIFICADOR,
+    TOPIC_CMD_MODO,
+    TOPIC_CMD_SETPOINT,
+    TOPIC_CMD_VENTILADOR,
+    TOPIC_SENSOR_HUMEDAD,
+    TOPIC_SENSOR_NIVEL,
+    TOPIC_SENSOR_TEMPERATURA,
+    TOPIC_STATE_ACTUADORES,
+    TOPIC_STATE_BOMBILLA,
+    TOPIC_STATE_HUMIDIFICADOR,
+    TOPIC_STATE_MODO,
+    TOPIC_STATE_SETPOINT,
+    TOPIC_STATE_VENTILADOR,
+    TOPIC_SUBSCRIBE_ALL,
+    TOPIC_SYSTEM_ALARMA,
+)
+from config import get_config
 
-app = Flask(__name__)
-
-BASE_DIR = Path(__file__).resolve().parent
-FRONTEND_HTML = (BASE_DIR / "frontend.html").read_text(encoding="utf-8")
-
-BROKER_HOST = "broker.emqx.io"
-BROKER_PORT = 1883
-CLIENT_ID = "invernadero_web_01"
-
-ROOT_TOPIC = "invernadero"
-
-state = {
+_STATE: Dict[str, Any] = {
     "temperatura": None,
     "humedad": None,
     "nivel_agua": None,
-    "temperatura_uncertainty": 0.35,
-    "humedad_uncertainty": 2.0,
-    "nivel_agua_uncertainty": 1.0,
     "ventilador": "OFF",
     "bombilla": "OFF",
     "humidificador": "OFF",
     "modo": "AUTO",
     "setpoint": 70,
     "alarma": "",
+    "connected": False,
+    "connection_status": "Desconectado",
     "last_update": None,
 }
 
-history = deque(maxlen=40)
+_STATE_LOCK = threading.Lock()
+_MQTT_MANAGER: Optional[MQTTManager] = None
+_INITIALIZED = False
 
-mqtt_client = None
-mqtt_lock = threading.Lock()
+
+def _set_state_value(key: str, value: Any) -> None:
+    with _STATE_LOCK:
+        _STATE[key] = value
+        _STATE["last_update"] = time.time()
+
+
+def _parse_numeric(payload: str) -> Optional[float]:
+    try:
+        return float(payload)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_actuators(payload: str) -> None:
+    parts = [item.strip() for item in payload.split(";") if item.strip()]
+    for item in parts:
+        if "=" not in item:
+            continue
+        name, value = item.split("=", 1)
+        normalized = name.strip().lower()
+        if normalized in {"ventilador", "bombilla", "humidificador"}:
+            _set_state_value(normalized, value.strip().upper())
+
+
+def _handle_message(topic: str, payload: str) -> None:
+    decoded_payload = payload.strip()
+
+    if topic == TOPIC_SENSOR_TEMPERATURA:
+        numeric_value = _parse_numeric(decoded_payload)
+        if numeric_value is not None:
+            _set_state_value("temperatura", numeric_value)
+    elif topic == TOPIC_SENSOR_HUMEDAD:
+        numeric_value = _parse_numeric(decoded_payload)
+        if numeric_value is not None:
+            _set_state_value("humedad", numeric_value)
+    elif topic == TOPIC_SENSOR_NIVEL:
+        numeric_value = _parse_numeric(decoded_payload)
+        if numeric_value is not None:
+            _set_state_value("nivel_agua", numeric_value)
+    elif topic == TOPIC_STATE_ACTUADORES:
+        _parse_actuators(decoded_payload)
+    elif topic == TOPIC_STATE_BOMBILLA:
+        _set_state_value("bombilla", decoded_payload.upper())
+    elif topic == TOPIC_STATE_VENTILADOR:
+        _set_state_value("ventilador", decoded_payload.upper())
+    elif topic == TOPIC_STATE_HUMIDIFICADOR:
+        _set_state_value("humidificador", decoded_payload.upper())
+    elif topic == TOPIC_STATE_MODO:
+        _set_state_value("modo", decoded_payload.upper())
+    elif topic == TOPIC_STATE_SETPOINT:
+        numeric_value = _parse_numeric(decoded_payload)
+        if numeric_value is not None:
+            _set_state_value("setpoint", int(numeric_value))
+    elif topic == TOPIC_SYSTEM_ALARMA:
+        _set_state_value("alarma", decoded_payload)
 
 
 def on_connect(client, userdata, flags, rc, properties=None):
     if rc != 0:
-        app.logger.error("MQTT connection failed with rc=%s", rc)
+        _set_state_value("connection_status", f"Error de conexión: {rc}")
         return
-    app.logger.info("MQTT connected, subscribing to %s/#", ROOT_TOPIC)
-    client.subscribe(f"{ROOT_TOPIC}/#")
+
+    _set_state_value("connected", True)
+    _set_state_value("connection_status", "Conectado")
 
 
 def on_message(client, userdata, msg):
-    global state
     topic = msg.topic
     payload = msg.payload.decode("utf-8", errors="ignore")
-
-    with mqtt_lock:
-        if topic.endswith("temperatura"):
-            try:
-                state["temperatura"] = float(payload)
-            except ValueError:
-                pass
-        elif topic.endswith("humedad"):
-            try:
-                state["humedad"] = float(payload)
-            except ValueError:
-                pass
-        elif topic.endswith("nivel_agua"):
-            try:
-                state["nivel_agua"] = float(payload)
-            except ValueError:
-                pass
-        elif topic.endswith("actuadores"):
-            parts = payload.split(";")
-            for item in parts:
-                if "=" in item:
-                    key, value = item.split("=", 1)
-                    key = key.strip().lower()
-                    if key in {"ventilador", "bombilla", "humidificador"}:
-                        state[key] = value.upper()
-        elif topic.endswith("ventilador"):
-            state["ventilador"] = payload.upper()
-        elif topic.endswith("bombilla"):
-            state["bombilla"] = payload.upper()
-        elif topic.endswith("humidificador"):
-            state["humidificador"] = payload.upper()
-        elif topic.endswith("modo"):
-            state["modo"] = payload.upper()
-        elif topic.endswith("setpoint"):
-            try:
-                state["setpoint"] = int(float(payload))
-            except ValueError:
-                pass
-        elif topic.endswith("alarma"):
-            state["alarma"] = payload
-
-        state["last_update"] = time.time()
-        history.append({
-            "timestamp": time.time(),
-            "temperatura": state["temperatura"],
-            "humedad": state["humedad"],
-            "nivel_agua": state["nivel_agua"],
-            "modo": state["modo"],
-        })
+    _handle_message(topic, payload)
 
 
-def connect_mqtt():
-    global mqtt_client
-    mqtt_client = mqtt.Client(client_id=CLIENT_ID, callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
-    mqtt_client.on_connect = on_connect
-    mqtt_client.on_message = on_message
-    mqtt_client.connect(BROKER_HOST, BROKER_PORT, 60)
-    mqtt_client.loop_start()
+def initialize_backend() -> MQTTManager:
+    global _MQTT_MANAGER, _INITIALIZED
+
+    if _INITIALIZED and _MQTT_MANAGER is not None:
+        return _MQTT_MANAGER
+
+    config = get_config()
+    _MQTT_MANAGER = MQTTManager(
+        broker=config["broker"],
+        port=config["port"],
+        username=config["username"],
+        password=config["password"],
+        client_id=config["client_id"],
+        on_connect_callback=on_connect,
+        on_message_callback=on_message,
+        subscription_topics=[TOPIC_SUBSCRIBE_ALL],
+    )
+    _MQTT_MANAGER.start()
+    _INITIALIZED = True
+    return _MQTT_MANAGER
 
 
-@app.route("/")
-def index():
-    return render_template_string(FRONTEND_HTML)
+def get_state_snapshot() -> Dict[str, Any]:
+    with _STATE_LOCK:
+        return deepcopy(_STATE)
 
 
-@app.route("/api/state")
-def api_state():
-    with mqtt_lock:
-        payload = dict(state)
-    return jsonify(payload)
+def publish_command(actuator: str, command: str) -> bool:
+    manager = initialize_backend()
+    topic_map = {
+        "bombilla": TOPIC_CMD_BOMBILLA,
+        "ventilador": TOPIC_CMD_VENTILADOR,
+        "humidificador": TOPIC_CMD_HUMIDIFICADOR,
+    }
+
+    topic = topic_map.get(actuator.lower())
+    if topic is None:
+        return False
+    return manager.publish(topic, str(command).upper())
 
 
-@app.route("/api/control/<action>", methods=["POST"])
-def api_control(action):
-    data = {}
-    try:
-        data = json.loads(request.get_data(as_text=True) or "{}")
-    except Exception:
-        data = {}
-
-    if action == "modo":
-        mode = data.get("mode", "AUTO").upper()
-        if mqtt_client is not None:
-            mqtt_client.publish(f"{ROOT_TOPIC}/configuracion/modo", mode)
-        return jsonify({"ok": True, "mode": mode})
-
-    if action == "setpoint":
-        value = int(data.get("value", 70))
-        if mqtt_client is not None:
-            mqtt_client.publish(f"{ROOT_TOPIC}/configuracion/setpoint", str(value))
-        return jsonify({"ok": True, "value": value})
-
-    if action == "actuador":
-        name = data.get("name", "").lower()
-        cmd = data.get("command", "OFF").upper()
-        if name in {"ventilador", "bombilla", "humidificador"}:
-            if mqtt_client is not None:
-                mqtt_client.publish(f"{ROOT_TOPIC}/comandos/{name}", cmd)
-            return jsonify({"ok": True, "name": name, "command": cmd})
-
-    return jsonify({"ok": False, "error": "Acción no válida"}), 400
+def set_mode(mode: str) -> bool:
+    return initialize_backend().publish(TOPIC_CMD_MODO, str(mode).upper())
 
 
-if __name__ == "__main__":
-    connect_mqtt()
-    app.run(host="0.0.0.0", port=5000, debug=True)
+def set_setpoint(value: int) -> bool:
+    return initialize_backend().publish(TOPIC_CMD_SETPOINT, str(int(value)))
+
+
+def shutdown_backend() -> None:
+    global _MQTT_MANAGER, _INITIALIZED
+
+    if _MQTT_MANAGER is not None:
+        _MQTT_MANAGER.stop()
+    _MQTT_MANAGER = None
+    _INITIALIZED = False
+    _set_state_value("connected", False)
+    _set_state_value("connection_status", "Desconectado")
