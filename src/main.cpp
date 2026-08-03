@@ -45,6 +45,7 @@ volatile float temperatura2 = 21;
 volatile float humedad2 = 0;
 volatile float temperaturaPromedio = 0;
 volatile float humedadPromedio = 0;
+volatile bool flag_enviarDatos = false;
 
 //Variable para almacenar el nivel del agua
 volatile float nivel_agua = 0;
@@ -127,6 +128,7 @@ void setup() {
     wifiManager.begin();
     mqttManager.begin();
     mqttManager.setMessageHandler(manejarMensajeMQTT);
+    estadoActual = medirTemperatura; // Estado inicial de la máquina de estados
 
 }
 
@@ -151,22 +153,18 @@ void maquinaDeEstados() {
           case IDLE:
             break;
 
-          case enviarDatos:
+          case medirTemperatura:
+          if (flag_enviarDatos == true) {
+                flag_enviarDatos = false; // Bajamos la bandera
             funcion_enviarTemperatura();
             funcion_enviarNivelAgua();
             //Condicional para generar el estado de alarma
             if (nivel_agua < 7){
               Serial.println("A_");
             }
-            if (modoControl == automatico) {
-              estadoActual = medirTemperatura;
-            }
-            else {
-              estadoActual = IDLE;
-            }
-            break;
 
-          case medirTemperatura:
+            }
+            }
               temperatura1 = dht1.readTemperature();
               temperatura2 = dht2.readTemperature();
               temperaturaPromedio = (temperatura1 + temperatura2) / 2.0f;
@@ -239,7 +237,7 @@ void maquinaDeEstados() {
               digitalWrite(disparador,LOW);
               detachInterrupt(digitalPinToInterrupt(zero_cross)); // Deshabilitamos la interrupción del cruce por cero
               bombillaActiva = false;
-              digitalWrite(ventilador, HIGH); // Encender el ventilador
+              digitalWrite(ventilador, HIGH);
               ventiladorActivo = false;
               estadoActual = medirTemperatura; // Volvemos a medir la humedad
               break;
@@ -310,7 +308,7 @@ void configurarTimer(float frecuenciaHz) {
 
 
 void funcionInterrupcion(timer_callback_args_t *args) {
-    estadoActual = enviarDatos; // Cambiamos al estado de enviar datos
+    flag_enviarDatos = true; // Cambiamos al estado de enviar datos
    
 }
 
@@ -325,12 +323,6 @@ void leerSensores() {
 }
 
 void funcion_enviarTemperatura() {
-    Serial.print("T_");
-    Serial.print (temperatura1);
-    Serial.print ("_");
-    Serial.print (temperatura2);
-    Serial.print ("_");
-    Serial.print (temperaturaPromedio);
 
     mqttManager.publish(TOPIC_SENSOR_TEMPERATURA,
                          String(temperaturaPromedio, 2).c_str());
@@ -530,23 +522,24 @@ void calcularDutyCycle() {
     // Asegurarse de que el duty cycle esté entre 0 y 1
     if (duty < 0.0f) duty = 0.0f;
     if (duty > 1.0f) duty = 1.0f;
+    Serial.print("Duty cycle calculado: ");
+    Serial.println(duty);
 }
 
-void PWM_Humidificador(){
-    unsigned long ahora = millis();
-
-    unsigned long tiempo = ahora - inicioPeriodo;
-
-    if(tiempo >= periodo_ms)
-    {
-        inicioPeriodo += periodo_ms;
-
-        tiempo = ahora - inicioPeriodo;
+void PWM_Humidificador() {
+    unsigned long tiempo_actual = millis();
+    unsigned long tiempo = tiempo_actual - inicioPeriodo;
+    unsigned long tiempoON;
+    if (!humidificadorActivo) {
+        digitalWrite(PIN_Humidificador, LOW);
+        return; 
     }
 
-    unsigned long tiempoON = periodo_ms * duty;
-
+    if(tiempo >= periodo_ms) {
+        inicioPeriodo = tiempo_actual; 
+        tiempo = 0;
+    }
+    tiempoON = periodo_ms * duty;
     digitalWrite(PIN_Humidificador, tiempo < tiempoON);
 }
-
 
