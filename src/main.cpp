@@ -277,8 +277,39 @@ void maquinaDeEstados() {
       break;
 
     case manual:
-      // En modo manual, no hacemos nada en la máquina de estados
-      break;
+          switch (estadoActual) {
+          case IDLE:
+            // Solo salimos de IDLE si el timer levantó la bandera
+            if (flag_enviarDatos == true) {
+                flag_enviarDatos = false;
+                estadoActual = enviarDatos;
+            }
+            break;
+
+          case enviarDatos:
+            funcion_enviarTemperatura();
+            funcion_enviarNivelAgua();
+            // Condicional para generar el estado de alarma
+            if (nivel_agua < 7){
+              Serial.println("A_");
+            }
+            if (modoControl == automatico) {
+              estadoActual = medirTemperatura;
+            } else {
+              estadoActual = IDLE;
+            }
+            break;
+
+          case medirTemperatura:
+              temperatura1 = dht1.readTemperature();
+              temperatura2 = dht2.readTemperature();
+              temperaturaPromedio = (temperatura1 + temperatura2) / 2.0f;
+              humedad1 = dht1.readHumidity();
+              humedad2 = dht2.readHumidity();
+              humedadPromedio = (humedad1 + humedad2) / 2.0f;
+              estadoActual = IDLE; // En modo manual, no hacemos más acciones automáticas
+              break;
+          }break;
 
     default:
       break;
@@ -525,6 +556,6 @@ void PWM_Humidificador() {
         tiempo = 0;
     }
     
-    unsigned long tiempoON = periodo_ms * (1 -duty);
+    unsigned long tiempoON = periodo_ms * (1-duty);
     digitalWrite(PIN_Humidificador, tiempo < tiempoON);
 }
