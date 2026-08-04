@@ -110,7 +110,6 @@ void setup() {
     digitalWrite(PIN_Humidificador, LOW);
     
     pinMode(zero_cross, INPUT); // Configuramos el pin del cruce por cero como entrada
-    // attachInterrupt(digitalPinToInterrupt(zero_cross), funcionPara_disparar, RISING); 
     
     pinMode(disparador, OUTPUT);
     digitalWrite(disparador, LOW);
@@ -187,7 +186,7 @@ void maquinaDeEstados() {
               break;
 
           case tempAlta:
-              // Si la temperatura es alta, apagamos bombilla y encendemos ventilador
+              // Si la temperatura is alta, apagamos bombilla y encendemos ventilador
               detachInterrupt(digitalPinToInterrupt(zero_cross)); 
               bombillaActiva = false;
               digitalWrite(disparador, LOW);
@@ -199,6 +198,10 @@ void maquinaDeEstados() {
           case medirRH_Talta:
               humedad1 = dht1.readHumidity();
               humedad2 = dht2.readHumidity();
+              Serial.print("Humedad1: ");
+              Serial.println(humedad1);
+              Serial.print("Humedad2: ");
+              Serial.println(humedad2);
               humedadPromedio = (humedad1 + humedad2) / 2.0f;
 
               if (humedadPromedio < 70){
@@ -299,7 +302,7 @@ void maquinaDeEstados() {
             if (modoControl == automatico) {
               estadoActual = medirTemperatura;
             } else {
-              estadoActual = IDLE;
+              estadoActual = medirTemperatura; // En modo manual, pasamos a medir sensores para actualizar el PID y datos
             }
             break;
 
@@ -310,9 +313,20 @@ void maquinaDeEstados() {
               humedad1 = dht1.readHumidity();
               humedad2 = dht2.readHumidity();
               humedadPromedio = (humedad1 + humedad2) / 2.0f;
-              estadoActual = IDLE; // En modo manual, no hacemos más acciones automáticas
+
+              // En modo manual, si el humidificador está activo, ejecutamos el PID con el setpoint recibido
+              if (humidificadorActivo) {
+                  calcularDutyCycle();
+              }
+              
+              estadoActual = IDLE; 
               break;
-          }break;
+          
+          default:
+            estadoActual = IDLE;
+            break;
+          }
+          break;
 
     default:
       break;
@@ -396,7 +410,7 @@ void funcion_enviarTemperatura() {
     Serial.print (temperatura2);
     Serial.print ("_");
     Serial.print (temperaturaPromedio);
-    Serial.println(); // Añadido para mejor visualización en consola
+    Serial.println(); 
 
     mqttManager.publish(TOPIC_SENSOR_TEMPERATURA,
                          String(temperaturaPromedio, 2).c_str());
