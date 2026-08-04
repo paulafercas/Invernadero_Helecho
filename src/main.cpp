@@ -299,11 +299,7 @@ void maquinaDeEstados() {
             if (nivel_agua < 7){
               Serial.println("A_");
             }
-            if (modoControl == automatico) {
-              estadoActual = medirTemperatura;
-            } else {
-              estadoActual = medirTemperatura; // En modo manual, pasamos a medir sensores para actualizar el PID y datos
-            }
+            estadoActual = medirTemperatura;
             break;
 
           case medirTemperatura:
@@ -390,6 +386,7 @@ void aplicarEstadoActuadores() {
     } else {
         if (interruptBombillaRegistrado) {
             detachInterrupt(digitalPinToInterrupt(zero_cross));
+            digitalWrite(disparador, LOW);
             interruptBombillaRegistrado = false;
         }
         digitalWrite(disparador, LOW);
@@ -399,6 +396,12 @@ void aplicarEstadoActuadores() {
         digitalWrite(ventilador, LOW);
     } else {
         digitalWrite(ventilador, HIGH);
+    }
+    if (humidificadorActivo) {
+      calcularDutyCycle();
+        // El loop se encarga de ejecutar el PWM del humidificador
+    } else {
+        digitalWrite(PIN_Humidificador, HIGH); // Apagamos el humidificador
     }
 }
 
@@ -412,10 +415,13 @@ void funcion_enviarTemperatura() {
     Serial.print (temperaturaPromedio);
     Serial.println(); 
 
+    String payloadTemperatura = String(temperaturaPromedio, 2);
+    String payloadHumedad = String(humedadPromedio, 2);
+
     mqttManager.publish(TOPIC_SENSOR_TEMPERATURA,
-                         String(temperaturaPromedio, 2).c_str());
+                         payloadTemperatura.c_str());
     mqttManager.publish(TOPIC_SENSOR_HUMEDAD,
-                         String(humedadPromedio, 2).c_str());
+                         payloadHumedad.c_str());
     publicarEstadoActuadores();
     publicarEstadoControl();
 }
@@ -437,7 +443,8 @@ void funcion_enviarNivelAgua (){
     nivel_agua = 14.2 * voltaje;
   }
 
-  mqttManager.publish(TOPIC_SENSOR_NIVEL_AGUA, String(int(nivel_agua)).c_str());
+  String payloadNivelAgua = String(int(nivel_agua));
+  mqttManager.publish(TOPIC_SENSOR_NIVEL_AGUA, payloadNivelAgua.c_str());
 
   if (nivel_agua < 7) {
     mqttManager.publish(TOPIC_SISTEMA_ALARMA, ALARM_TANQUE_VACIO);
@@ -488,6 +495,16 @@ void funcionInterpretarMensaje(const String& mensaje) {
     aplicarEstadoActuadores();
     publicarEstadoActuadores();
   }
+  else if (mensaje.equalsIgnoreCase("ENCENDER")) {
+    humidificadorActivo = true;
+    aplicarEstadoActuadores();
+    publicarEstadoActuadores();
+  }
+  else if (mensaje.equalsIgnoreCase("APAGAR")) {
+    humidificadorActivo = false;
+    aplicarEstadoActuadores();
+    publicarEstadoActuadores();
+  }
 }
 
 void funcionPara_disparar (){
@@ -524,12 +541,12 @@ void manejarMensajeMQTT(const char* topic, const char* payload) {
         }
     }
     else if (topicStr == TOPIC_CMD_HUMIDIFICADOR || topicStr.endsWith("/comandos/humidificador")) {
-        if (mensaje.equalsIgnoreCase(PAYLOAD_ON)) {
+        if (mensaje.equalsIgnoreCase(PAYLOAD_ON) || mensaje.equalsIgnoreCase("ENCENDER")) {
             humidificadorActivo = true;
             aplicarEstadoActuadores();
             publicarEstadoActuadores();
         }
-        else if (mensaje.equalsIgnoreCase(PAYLOAD_OFF)) {
+        else if (mensaje.equalsIgnoreCase(PAYLOAD_OFF) || mensaje.equalsIgnoreCase("APAGAR")) {
             humidificadorActivo = false;
             aplicarEstadoActuadores();
             publicarEstadoActuadores();
