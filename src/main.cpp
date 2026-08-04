@@ -98,6 +98,7 @@ void publicarEstadoActuadores();
 void publicarEstadoControl();
 void maquinaDeEstados();
 void leerSensores();
+void aplicarEstadoActuadores();
 
 void setup() {
     Serial.begin(115200);
@@ -116,6 +117,7 @@ void setup() {
     
     pinMode(ventilador, OUTPUT);
     digitalWrite(ventilador, HIGH); // Apagado por defecto (Relé Active-LOW)
+    aplicarEstadoActuadores();
     
     inicioPeriodo = millis();
 
@@ -140,6 +142,7 @@ void loop() {
 
   // Máquina de estados controlada por la bandera del temporizador
   maquinaDeEstados();
+  aplicarEstadoActuadores();
   
   // El PWM debe correr continuamente, independiente de los estados
   PWM_Humidificador();
@@ -339,16 +342,54 @@ void funcionInterrupcion(timer_callback_args_t *args) {
 }
 
 void leerSensores() {
-    temperatura1 = dht1.readTemperature();
-    temperatura2 = dht2.readTemperature();
-    temperaturaPromedio = (temperatura1 + temperatura2) / 2.0f;
+    float lecturaTemperatura1 = dht1.readTemperature();
+    float lecturaTemperatura2 = dht2.readTemperature();
+    float lecturaHumedad1 = dht1.readHumidity();
+    float lecturaHumedad2 = dht2.readHumidity();
 
-    humedad1 = dht1.readHumidity();
-    humedad2 = dht2.readHumidity();
+    if (!isnan(lecturaTemperatura1)) {
+        temperatura1 = lecturaTemperatura1;
+    }
+    if (!isnan(lecturaTemperatura2)) {
+        temperatura2 = lecturaTemperatura2;
+    }
+    if (!isnan(lecturaHumedad1)) {
+        humedad1 = lecturaHumedad1;
+    }
+    if (!isnan(lecturaHumedad2)) {
+        humedad2 = lecturaHumedad2;
+    }
+
+    temperaturaPromedio = (temperatura1 + temperatura2) / 2.0f;
     humedadPromedio = (humedad1 + humedad2) / 2.0f;
 }
 
+void aplicarEstadoActuadores() {
+    static bool interruptBombillaRegistrado = false;
+
+    if (bombillaActiva) {
+        if (!interruptBombillaRegistrado) {
+            attachInterrupt(digitalPinToInterrupt(zero_cross), funcionPara_disparar, RISING);
+            interruptBombillaRegistrado = true;
+        }
+        digitalWrite(disparador, LOW);
+    } else {
+        if (interruptBombillaRegistrado) {
+            detachInterrupt(digitalPinToInterrupt(zero_cross));
+            interruptBombillaRegistrado = false;
+        }
+        digitalWrite(disparador, LOW);
+    }
+
+    if (ventiladorActivo) {
+        digitalWrite(ventilador, LOW);
+    } else {
+        digitalWrite(ventilador, HIGH);
+    }
+}
+
 void funcion_enviarTemperatura() {
+    leerSensores();
     Serial.print("T_");
     Serial.print (temperatura1);
     Serial.print ("_");
@@ -413,34 +454,25 @@ void funcionInterpretarMensaje(const String& mensaje) {
     modoControl = manual;
     publicarEstadoControl();
   }
-  else if(mensaje.equalsIgnoreCase("V1")) {
-    if (modoControl == manual) {
-      digitalWrite(ventilador, LOW); // LOW enciende el relé
-      ventiladorActivo = true;
-      publicarEstadoActuadores();
-    }
+  else if(mensaje.equalsIgnoreCase("V1") || mensaje.equalsIgnoreCase(PAYLOAD_ON)) {
+    ventiladorActivo = true;
+    aplicarEstadoActuadores();
+    publicarEstadoActuadores();
   }
-  else if(mensaje.equalsIgnoreCase("V0")) {
-    if (modoControl == manual) {
-      digitalWrite(ventilador, HIGH); // HIGH apaga el relé
-      ventiladorActivo = false;
-      publicarEstadoActuadores();
-    }
+  else if(mensaje.equalsIgnoreCase("V0") || mensaje.equalsIgnoreCase(PAYLOAD_OFF)) {
+    ventiladorActivo = false;
+    aplicarEstadoActuadores();
+    publicarEstadoActuadores();
   }
   else if (mensaje.equalsIgnoreCase("B1")) {
-    if (modoControl == manual) {
-      attachInterrupt(digitalPinToInterrupt(zero_cross), funcionPara_disparar, RISING);
-      bombillaActiva = true;
-      publicarEstadoActuadores();
-    }
+    bombillaActiva = true;
+    aplicarEstadoActuadores();
+    publicarEstadoActuadores();
   }
   else if (mensaje.equalsIgnoreCase("B0")) {
-    if (modoControl == manual) {
-      detachInterrupt(digitalPinToInterrupt(zero_cross));
-      bombillaActiva = false;
-      digitalWrite(disparador, LOW);
-      publicarEstadoActuadores();
-    }
+    bombillaActiva = false;
+    aplicarEstadoActuadores();
+    publicarEstadoActuadores();
   }
 }
 
@@ -452,15 +484,16 @@ void funcionPara_disparar (){
 
 void manejarMensajeMQTT(const char* topic, const char* payload) {
     String mensaje = String(payload);
+    String topicStr = String(topic);
 
-    if (String(topic) == TOPIC_CFG_MODO) {
+    if (topicStr == TOPIC_CFG_MODO || topicStr.endsWith("/configuracion/modo")) {
         funcionInterpretarMensaje(mensaje);
     }
-    else if (String(topic) == TOPIC_CFG_SETPOINT) {
+    else if (topicStr == TOPIC_CFG_SETPOINT || topicStr.endsWith("/configuracion/setpoint")) {
         setpoint = mensaje.toInt();
         publicarEstadoControl();
     }
-    else if (String(topic) == TOPIC_CMD_BOMBILLA) {
+    else if (topicStr == TOPIC_CMD_BOMBILLA || topicStr.endsWith("/comandos/bombilla")) {
         if (mensaje.equalsIgnoreCase(PAYLOAD_ON)) {
             funcionInterpretarMensaje("B1");
         }
@@ -468,7 +501,7 @@ void manejarMensajeMQTT(const char* topic, const char* payload) {
             funcionInterpretarMensaje("B0");
         }
     }
-    else if (String(topic) == TOPIC_CMD_VENTILADOR) {
+    else if (topicStr == TOPIC_CMD_VENTILADOR || topicStr.endsWith("/comandos/ventilador")) {
         if (mensaje.equalsIgnoreCase(PAYLOAD_ON)) {
             funcionInterpretarMensaje("V1");
         }
@@ -476,13 +509,15 @@ void manejarMensajeMQTT(const char* topic, const char* payload) {
             funcionInterpretarMensaje("V0");
         }
     }
-    else if (String(topic) == TOPIC_CMD_HUMIDIFICADOR) {
+    else if (topicStr == TOPIC_CMD_HUMIDIFICADOR || topicStr.endsWith("/comandos/humidificador")) {
         if (mensaje.equalsIgnoreCase(PAYLOAD_ON)) {
             humidificadorActivo = true;
+            aplicarEstadoActuadores();
             publicarEstadoActuadores();
         }
         else if (mensaje.equalsIgnoreCase(PAYLOAD_OFF)) {
             humidificadorActivo = false;
+            aplicarEstadoActuadores();
             publicarEstadoActuadores();
         }
     }
