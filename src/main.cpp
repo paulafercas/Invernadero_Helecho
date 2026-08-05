@@ -83,6 +83,8 @@ typedef enum {
 } Modo;
 Modo modoControl = automatico;
 
+volatile bool interrupcionBombilla = false;
+
 // Prototipos de funciones
 void funcion_enviarTemperatura();
 void funcion_enviarNivelAgua();
@@ -115,7 +117,7 @@ void setup() {
     digitalWrite(disparador, LOW);
     
     pinMode(ventilador, OUTPUT);
-    digitalWrite(ventilador, HIGH); // Apagado por defecto (Relé Active-LOW)
+    digitalWrite(ventilador, LOW); // Apagado por defecto (Relé Active-LOW)
     aplicarEstadoActuadores();
     
     inicioPeriodo = millis();
@@ -145,6 +147,12 @@ void loop() {
   
   // El PWM debe correr continuamente, independiente de los estados
   PWM_Humidificador();
+  if (interrupcionBombilla) {
+      digitalWrite(disparador, LOW);
+      //delay(0); // Retardo para el Triac
+      digitalWrite(disparador, HIGH);
+      interrupcionBombilla = false; // Reiniciamos la bandera
+  }
 }
 
 void maquinaDeEstados() {
@@ -190,12 +198,12 @@ void maquinaDeEstados() {
               detachInterrupt(digitalPinToInterrupt(zero_cross)); 
               bombillaActiva = false;
               digitalWrite(disparador, LOW);
-              digitalWrite(ventilador, LOW); // LOW enciende el relé
-              ventiladorActivo = true;
+              digitalWrite(ventilador,HIGH); // LOW enciende el relé
               estadoActual = medirRH_Talta;
               break;
           
           case medirRH_Talta:
+              digitalWrite(ventilador,HIGH); // LOW enciende el relé
               humedad1 = dht1.readHumidity();
               humedad2 = dht2.readHumidity();
               Serial.print("Humedad1: ");
@@ -212,6 +220,8 @@ void maquinaDeEstados() {
               break;
 
           case RHbaja_Talta:
+              digitalWrite(ventilador, LOW); // Apagamos el ventilador (HIGH)
+              digitalWrite(ventilador,HIGH); // LOW enciende el relé
               humidificadorActivo = true;
               calcularDutyCycle(); // Calculamos, pero el loop ejecuta el PWM
               estadoActual = IDLE; // Volvemos a reposo para no saturar el DHT11
@@ -219,6 +229,7 @@ void maquinaDeEstados() {
 
           case RHalta_Talta:
               humidificadorActivo = false;
+              digitalWrite(ventilador,HIGH); // LOW enciende el relé
               // El loop apagará el humidificador automáticamente
               estadoActual = IDLE;
               break;
@@ -240,12 +251,12 @@ void maquinaDeEstados() {
           case RHbaja_Tbaja:
               humidificadorActivo = true;
               calcularDutyCycle(); 
-              
+              digitalWrite(ventilador, LOW); // Apagamos el ventilador (HIGH)
               digitalWrite(disparador, LOW);
               detachInterrupt(digitalPinToInterrupt(zero_cross)); 
               bombillaActiva = false;
               
-              digitalWrite(ventilador, HIGH); // Apagamos el ventilador (HIGH)
+              digitalWrite(ventilador, LOW); // Apagamos el ventilador (HIGH)
               ventiladorActivo = false;
               
               estadoActual = IDLE;
@@ -258,8 +269,7 @@ void maquinaDeEstados() {
               detachInterrupt(digitalPinToInterrupt(zero_cross)); 
               bombillaActiva = false;
               
-              digitalWrite(ventilador, LOW); // Encendemos el ventilador (LOW)
-              ventiladorActivo = true;
+              digitalWrite(ventilador,HIGH); // Encendemos el ventilador (LOW)
               
               estadoActual = IDLE;
               break;
@@ -299,6 +309,11 @@ void maquinaDeEstados() {
             if (nivel_agua < 7){
               Serial.println("A_");
             }
+            if (modoControl == manual) {
+              estadoActual = medirTemperatura;
+            } else {
+              estadoActual = IDLE;
+            }
             estadoActual = medirTemperatura;
             break;
 
@@ -314,7 +329,10 @@ void maquinaDeEstados() {
               if (humidificadorActivo) {
                   calcularDutyCycle();
               }
-              
+              else{
+                digitalWrite(PIN_Humidificador, HIGH); // Aseguramos que el humidificador esté apagado si no está activo
+              }
+              aplicarEstadoActuadores(); // Aplicamos el estado de los actuadores según las variables de control
               estadoActual = IDLE; 
               break;
           
@@ -377,27 +395,20 @@ void leerSensores() {
 void aplicarEstadoActuadores() {
     static bool interruptBombillaRegistrado = false;
 
-    if (bombillaActiva) {
-        if (!interruptBombillaRegistrado) {
+    if (bombillaActiva && modoControl == manual) {
             attachInterrupt(digitalPinToInterrupt(zero_cross), funcionPara_disparar, RISING);
-            interruptBombillaRegistrado = true;
-        }
-        digitalWrite(disparador, LOW);
+   
     } else {
-        if (interruptBombillaRegistrado) {
             detachInterrupt(digitalPinToInterrupt(zero_cross));
             digitalWrite(disparador, LOW);
-            interruptBombillaRegistrado = false;
-        }
-        digitalWrite(disparador, LOW);
     }
 
-    if (ventiladorActivo) {
-        digitalWrite(ventilador, LOW);
+    if (ventiladorActivo && modoControl == manual) {
+        digitalWrite(ventilador,HIGH);
     } else {
-        digitalWrite(ventilador, HIGH);
+        digitalWrite(ventilador,LOW);
     }
-    if (humidificadorActivo) {
+    if (humidificadorActivo && modoControl == manual) {
       calcularDutyCycle();
         // El loop se encarga de ejecutar el PWM del humidificador
     } else {
@@ -508,9 +519,7 @@ void funcionInterpretarMensaje(const String& mensaje) {
 }
 
 void funcionPara_disparar (){
-    digitalWrite(disparador, LOW);
-    delay(6); // Retardo para el Triac 
-    digitalWrite(disparador, HIGH);
+    interrupcionBombilla = true; // Marcamos que la interrupción ha ocurrido
 }
 
 void manejarMensajeMQTT(const char* topic, const char* payload) {
